@@ -35,14 +35,11 @@ async function verifyApiKey(apiKey: string): Promise<boolean> {
   }
 }
 
-async function uploadFromDirectLink(
-  directLink: string,
-): Promise<{ name: string; url: string }> {
+async function uploadFromDirectLink(directLink: string): Promise<{ name: string; url: string }> {
   const response = await fetch(directLink);
   if (!response.ok) throw new Error(`Failed to fetch file from ${directLink}`);
 
-  const contentType =
-    response.headers.get("content-type") || "application/octet-stream";
+  const contentType = response.headers.get("content-type") || "application/octet-stream";
   const contentDisposition = response.headers.get("content-disposition");
   const sourceUrl = new URL(directLink);
   let filename = sourceUrl.pathname.split("/").pop() || "downloaded_file";
@@ -54,19 +51,12 @@ async function uploadFromDirectLink(
     }
   }
 
-  // Remove any remaining quotes from the filename
-  filename = filename.replace(/"/g, "");
+  filename = filename.replace(/"/g, ""); // Remove any remaining quotes
 
   const blobStream = cloudStorage.getWriteStream(filename);
-  if (response.body) {
-    await pipeline(response.body, blobStream);
-  } else {
-    throw new Error("Response body is null");
-  }
+  await pipeline(response.body, blobStream);
 
-  // Make the file public
   await cloudStorage.makeFilePublic(filename);
-
   await cloudStorage.setFileMetadata(filename, {
     contentType,
     contentDisposition: `${contentType.startsWith("text/") ? "inline" : "attachment"}; filename="${filename}"`,
@@ -82,7 +72,7 @@ export async function POST(request: NextRequest) {
   if (!apiKey || !(await verifyApiKey(apiKey))) {
     return NextResponse.json(
       { error: "Unauthorized: Invalid or missing API key", key: apiKey },
-      { status: 401 },
+      { status: 401 }
     );
   }
 
@@ -100,10 +90,8 @@ export async function POST(request: NextRequest) {
       } catch (error) {
         console.error(error);
         return NextResponse.json(
-          {
-            error: `Error uploading file from direct link: ${(error as Error).message}`,
-          },
-          { status: 500 },
+          { error: `Error uploading file from direct link: ${(error as Error).message}` },
+          { status: 500 }
         );
       }
     }
@@ -115,109 +103,75 @@ export async function POST(request: NextRequest) {
       headers[key] = value;
     });
 
-    const busboy = Busboy({ headers });
+    const busboy = new Busboy({ headers });
     const uploadPromises: Promise<{ name: string; url: string }>[] = [];
     let fileUploaded = false;
 
-    busboy.on(
-      "file",
-      (
-        fieldname: string,
-        file: NodeJS.ReadableStream,
-        info: Busboy.FileInfo,
-      ) => {
-        const { filename, mimeType } = info;
-        if (!filename) {
-          // Skip this file if no filename is provided
-          file.resume();
-          return;
-        }
+    busboy.on("file", (fieldname, file, { filename, mimeType }) => {
+      if (!filename) {
+        file.resume();
+        return;
+      }
 
-        fileUploaded = true;
-        let fileSize = 0;
-        const blobStream = cloudStorage.getWriteStream(filename);
-        const uploadPromise = new Promise<{ name: string; url: string }>(
-          async (resolveUpload, rejectUpload) => {
-            file.on("data", (data: Buffer) => {
-              fileSize += data.length;
-              if (fileSize > MAX_FILE_SIZE) {
-                file.resume();
-                blobStream.destroy(
-                  new Error(
-                    `File ${filename} exceeds the maximum allowed size of 6 GB.,`,
-                  ),
-                );
-                rejectUpload(
-                  new Error(
-                    `File ${filename} exceeds the maximum allowed size of 6 GB.`,
-                  ),
-                );
-              }
+      fileUploaded = true;
+      let fileSize = 0;
+      const blobStream = cloudStorage.getWriteStream(filename);
+
+      const uploadPromise = new Promise<{ name: string; url: string }>((resolveUpload, rejectUpload) => {
+        const handleError = (error: Error) => {
+          console.error(`Error processing file ${filename}:`, error);
+          file.resume(); // Stop reading the stream
+          blobStream.destroy(error); // Properly destroy the stream
+          rejectUpload(error);
+        };
+
+        file.on("data", (data) => {
+          fileSize += data.length;
+          if (fileSize > MAX_FILE_SIZE) {
+            handleError(new Error(`File ${filename} exceeds the maximum allowed size of 6 GB.`));
+          }
+        });
+
+        file.on("error", handleError);
+        blobStream.on("error", handleError);
+
+        blobStream.on("finish", async () => {
+          try {
+            await cloudStorage.makeFilePublic(filename);
+            await cloudStorage.setFileMetadata(filename, {
+              contentType: mimeType,
+              contentDisposition: `${mimeType.startsWith("text/") ? "inline" : "attachment"}; filename="${filename}"`,
             });
+            const fileUrl = `${BASE_URL}/api/download?filename=${encodeURIComponent(filename)}`;
+            resolveUpload({ name: filename, url: fileUrl });
+          } catch (error) {
+            rejectUpload(error);
+          }
+        });
 
-            file.pipe(blobStream);
+        // Use pipeline to handle backpressure and improve efficiency
+        pipeline(file, blobStream).catch(handleError);
+      });
 
-            blobStream.on("finish", async () => {
-              try {
-                await cloudStorage.makeFilePublic(filename);
-                await cloudStorage.setFileMetadata(filename, {
-                  contentType: mimeType,
-                  contentDisposition: `${mimeType.startsWith("text/") ? "inline" : "attachment"}; filename="${filename}"`,
-                });
-
-                const fileUrl = `${BASE_URL}/api/download?filename=${encodeURIComponent(filename)}`;
-                resolveUpload({ name: filename, url: fileUrl });
-              } catch (error) {
-                rejectUpload(error);
-              }
-            });
-
-            blobStream.on("error", (error) => {
-              rejectUpload(error);
-            });
-          },
-        );
-
-        uploadPromises.push(uploadPromise);
-      },
-    );
+      uploadPromises.push(uploadPromise);
+    });
 
     busboy.on("finish", async () => {
       if (!fileUploaded) {
-        resolve(
-          NextResponse.json(
-            { error: "No valid file was uploaded" },
-            { status: 400 },
-          ),
-        );
+        resolve(NextResponse.json({ error: "No valid file was uploaded" }, { status: 400 }));
       } else {
         try {
           const uploadedFiles = await Promise.all(uploadPromises);
-          resolve(
-            NextResponse.json({
-              message: "Files uploaded successfully",
-              files: uploadedFiles,
-            }),
-          );
+          resolve(NextResponse.json({ message: "Files uploaded successfully", files: uploadedFiles }));
         } catch (error) {
-          resolve(
-            NextResponse.json(
-              { error: `Error uploading files: ${(error as Error).message}` },
-              { status: 500 },
-            ),
-          );
+          resolve(NextResponse.json({ error: `Error uploading files: ${(error as Error).message}` }, { status: 500 }));
         }
       }
     });
 
     busboy.on("error", (error: Error) => {
       console.error(error);
-      resolve(
-        NextResponse.json(
-          { error: `Error uploading files: ${error.message}` },
-          { status: 500 },
-        ),
-      );
+      resolve(NextResponse.json({ error: `Error uploading files: ${error.message}` }, { status: 500 }));
     });
 
     if (request.body) {
